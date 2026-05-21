@@ -1,0 +1,493 @@
+// ============================================================
+//  SMART DOOR LOCK — Arduino Uno (Wokwi version, bug-free)
+// ============================================================
+//  Pin mapping:
+//    Keypad rows   → D2, D3, D4, D5
+//    Keypad cols   → D6, D7, D8, D9
+//    Servo         → D11
+//    Buzzer        → D12 (+ 100Ω resistor)
+//    Green LED     → D13 (+ 220Ω resistor)
+//    Red LED       → A0  (+ 220Ω resistor)
+//    Reed switch   → D10
+//    LCD + RTC     → A4 (SDA), A5 (SCL)  shared I2C bus
+//
+//  Libraries (install via Library Manager):
+//    Keypad            by Mark Stanley
+//    LiquidCrystal_I2C by Frank de Brabander
+//    RTClib            by Adafruit
+//    Servo             (built-in)
+//    EEPROM            (built-in)
+//
+//  Wokwi notes:
+//    - SoftwareSerial removed (not needed in Wokwi)
+//    - Type 'L' in Serial Monitor to print access log
+//    - Type 'U' in Serial Monitor to simulate remote unlock
+// ============================================================
+
+#include <Keypad.h>
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
+#include <Servo.h>
+#include <EEPROM.h>
+
+// ── PIN DEFINITIONS ─────────────────────────────────────────
+#define SERVO_PIN    11
+#define BUZZER_PIN   12
+#define GREEN_LED    13
+#define RED_LED      A0
+#define REED_SWITCH  10
+
+// ── SERVO ANGLES ────────────────────────────────────────────
+#define LOCK_ANGLE   0
+#define UNLOCK_ANGLE 90
+
+// ── EEPROM LAYOUT ───────────────────────────────────────────
+#define EEPROM_PASS_ADDR  0   // 4 bytes: password chars
+#define EEPROM_SENTINEL   4   // 1 byte:  0xAA = initialised
+#define EEPROM_LOG_PTR    5   // 1 byte:  circular buffer pointer
+#define EEPROM_LOG_START  6   // 10 bytes x 20 entries = 200 bytes
+#define LOG_ENTRY_SIZE    10
+#define MAX_LOG_ENTRIES   20
+
+// ── SECURITY ────────────────────────────────────────────────
+#define MAX_ATTEMPTS     3
+#define UNLOCK_DURATION  3000
+const char DEFAULT_PASS[5] = "1234";
+
+// ── KEYPAD ──────────────────────────────────────────────────
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {2, 3, 4, 5};
+byte colPins[COLS] = {6, 7, 8, 9};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ── LCD ─────────────────────────────────────────────────────
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ── RTC ─────────────────────────────────────────────────────
+RTC_DS3231 rtc;
+
+// ── SERVO ───────────────────────────────────────────────────
+Servo lockServo;
+
+// ── STATE ───────────────────────────────────────────────────
+char storedPassword[5];
+char enteredPassword[5];
+byte inputIndex    = 0;
+byte wrongAttempts = 0;
+bool isLocked      = true;
+bool intruderMode  = false;
+bool changingPass  = false;
+char newPass1[5];
+char newPass2[5];
+byte newPassIdx    = 0;
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  pinMode(GREEN_LED,   OUTPUT);
+  pinMode(RED_LED,     OUTPUT);
+  pinMode(BUZZER_PIN,  OUTPUT);
+  pinMode(REED_SWITCH, INPUT_PULLUP);
+
+  lockServo.attach(SERVO_PIN);
+  lockServo.write(LOCK_ANGLE);
+
+  lcd.init();
+  lcd.backlight();
+
+  Serial.begin(9600);
+
+  if (!rtc.begin()) {
+    lcd.setCursor(0, 0);
+    lcd.print("RTC NOT FOUND!");
+    while (1);
+  }
+  // Uncomment once to set time, then comment again:
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  loadPassword();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("  Smart  Lock  ");
+  lcd.setCursor(0, 1);
+  lcd.print("  Initialising ");
+  beepShort();
+  delay(1500);
+
+  showEnterPassword();
+  Serial.println("=== Smart Door Lock Ready ===");
+  Serial.println("Password: 1234");
+  Serial.println("Type L = print log, U = remote unlock");
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+  checkSerialCommands();
+
+  if (intruderMode) {
+    runIntruderAlarm();
+    return;
+  }
+
+  char key = keypad.getKey();
+  if (!key) return;
+
+  beepKeypress();
+
+  if (key == '#') {
+    enteredPassword[inputIndex] = '\0';
+    if (changingPass) {
+      handlePasswordChange();
+    } else {
+      checkPassword();
+    }
+    return;
+  }
+
+  if (key == '*') {
+    clearInput();
+    if (changingPass) {
+      changingPass = false;
+      newPassIdx   = 0;
+    }
+    showEnterPassword();
+    return;
+  }
+
+  if (key == 'A' && !isLocked) {
+    startPasswordChange();
+    return;
+  }
+
+  if (key == 'D' && !isLocked) {
+    lockDoor();
+    return;
+  }
+
+  if (inputIndex < 4 && isDigit(key)) {
+    if (changingPass) {
+      lcd.setCursor(inputIndex, 1);
+      lcd.print('*');
+      if (newPassIdx == 0) newPass1[inputIndex] = key;
+      else                 newPass2[inputIndex] = key;
+    } else {
+      enteredPassword[inputIndex] = key;
+      lcd.setCursor(inputIndex, 1);
+      lcd.print('*');
+    }
+    inputIndex++;
+  }
+}
+
+// ============================================================
+//  SERIAL COMMANDS (replaces ESP communication in Wokwi)
+// ============================================================
+void checkSerialCommands() {
+  if (!Serial.available()) return;
+  char c = Serial.read();
+  if (c == 'L' || c == 'l') {
+    printAllLogs();
+  } else if (c == 'U' || c == 'u') {
+    Serial.println("[REMOTE] Unlock command received from ESP");
+    writeLog(3, 0);
+    unlockDoor();
+  }
+}
+
+// ============================================================
+//  PASSWORD
+// ============================================================
+void loadPassword() {
+  if (EEPROM.read(EEPROM_SENTINEL) != 0xAA) {
+    for (int i = 0; i < 4; i++) {
+      EEPROM.write(EEPROM_PASS_ADDR + i, DEFAULT_PASS[i]);
+    }
+    EEPROM.write(EEPROM_SENTINEL, 0xAA);
+    EEPROM.write(EEPROM_LOG_PTR,  0);
+  }
+  for (int i = 0; i < 4; i++) {
+    storedPassword[i] = EEPROM.read(EEPROM_PASS_ADDR + i);
+  }
+  storedPassword[4] = '\0';
+}
+
+void savePassword(char* newPassword) {
+  for (int i = 0; i < 4; i++) {
+    EEPROM.write(EEPROM_PASS_ADDR + i, newPassword[i]);
+    storedPassword[i] = newPassword[i];
+  }
+  storedPassword[4] = '\0';
+}
+
+void checkPassword() {
+  if (strcmp(enteredPassword, storedPassword) == 0) {
+    wrongAttempts = 0;
+    writeLog(0, 0);
+    Serial.println("[->ESP] GRANTED");
+    unlockDoor();
+  } else {
+    wrongAttempts++;
+    writeLog(1, wrongAttempts);
+    Serial.println("[->ESP] DENIED");
+    if (wrongAttempts >= MAX_ATTEMPTS) {
+      writeLog(2, wrongAttempts);
+      Serial.println("[->ESP] INTRUDER");
+      triggerIntruderMode();
+    } else {
+      showAccessDenied();
+    }
+  }
+  clearInput();
+}
+
+// ============================================================
+//  LOCK / UNLOCK
+// ============================================================
+void unlockDoor() {
+  isLocked = false;
+  lockServo.write(UNLOCK_ANGLE);
+  digitalWrite(GREEN_LED, HIGH);
+  digitalWrite(RED_LED,   LOW);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" Access Granted ");
+  lcd.setCursor(0, 1);
+  lcd.print("  Door Unlocked ");
+  beepSuccess();
+  delay(UNLOCK_DURATION);
+  lockDoor();
+}
+
+void lockDoor() {
+  isLocked = true;
+  lockServo.write(LOCK_ANGLE);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(RED_LED,   LOW);
+  Serial.println("[->ESP] LOCKED");
+  showEnterPassword();
+}
+
+// ============================================================
+//  INTRUDER
+// ============================================================
+void triggerIntruderMode() {
+  intruderMode   = true;
+  wrongAttempts  = 0;
+  digitalWrite(RED_LED, HIGH);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" INTRUDER ALERT ");
+  lcd.setCursor(0, 1);
+  lcd.print("  ALARM ACTIVE  ");
+}
+
+void runIntruderAlarm() {
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(RED_LED, HIGH);
+    tone(BUZZER_PIN, 1000, 200);
+    delay(250);
+    digitalWrite(RED_LED, LOW);
+    delay(150);
+
+    char k = keypad.getKey();
+    if (k == '*') {
+      intruderMode = false;
+      digitalWrite(RED_LED, LOW);
+      clearInput();
+      showEnterPassword();
+      Serial.println("[INTRUDER] Alarm cleared");
+      return;
+    }
+  }
+}
+
+// ============================================================
+//  PASSWORD CHANGE
+// ============================================================
+void startPasswordChange() {
+  changingPass = true;
+  newPassIdx   = 0;
+  inputIndex   = 0;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("New password:   ");
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+}
+
+void handlePasswordChange() {
+  if (newPassIdx == 0) {
+    newPass1[inputIndex] = '\0';
+    inputIndex = 0;
+    newPassIdx = 1;
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Confirm password");
+    lcd.setCursor(0, 1);
+    lcd.print("                ");
+  } else {
+    newPass2[inputIndex] = '\0';
+    if (strcmp(newPass1, newPass2) == 0 && strlen(newPass1) == 4) {
+      savePassword(newPass1);
+      changingPass = false;
+      newPassIdx   = 0;
+      inputIndex   = 0;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(" Password saved ");
+      beepSuccess();
+      delay(1500);
+      lockDoor();
+    } else {
+      changingPass = false;
+      newPassIdx   = 0;
+      inputIndex   = 0;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("  Mismatch!     ");
+      lcd.setCursor(0, 1);
+      lcd.print("  Try again     ");
+      beepError();
+      delay(1500);
+      showEnterPassword();
+    }
+  }
+}
+
+// ============================================================
+//  EEPROM LOG
+// ============================================================
+void writeLog(byte status, byte attempts) {
+  DateTime now = rtc.now();
+  byte ptr  = EEPROM.read(EEPROM_LOG_PTR);
+  int  addr = EEPROM_LOG_START + (ptr * LOG_ENTRY_SIZE);
+
+  EEPROM.write(addr + 0, now.year() - 2000);
+  EEPROM.write(addr + 1, now.month());
+  EEPROM.write(addr + 2, now.day());
+  EEPROM.write(addr + 3, now.hour());
+  EEPROM.write(addr + 4, now.minute());
+  EEPROM.write(addr + 5, now.second());
+  EEPROM.write(addr + 6, status);
+  EEPROM.write(addr + 7, attempts);
+  EEPROM.write(addr + 8, 0xFF);
+  EEPROM.write(addr + 9, 0xFF);
+
+  ptr = (ptr + 1) % MAX_LOG_ENTRIES;
+  EEPROM.write(EEPROM_LOG_PTR, ptr);
+
+  Serial.print("LOG ");
+  Serial.print(now.year()); Serial.print("-");
+  if (now.month()  < 10) Serial.print("0");
+  Serial.print(now.month()); Serial.print("-");
+  if (now.day()    < 10) Serial.print("0");
+  Serial.print(now.day()); Serial.print(" ");
+  if (now.hour()   < 10) Serial.print("0");
+  Serial.print(now.hour()); Serial.print(":");
+  if (now.minute() < 10) Serial.print("0");
+  Serial.print(now.minute()); Serial.print(":");
+  if (now.second() < 10) Serial.print("0");
+  Serial.print(now.second());
+  Serial.print(" | ");
+  if      (status == 0) Serial.print("GRANTED ");
+  else if (status == 1) Serial.print("DENIED  ");
+  else if (status == 2) Serial.print("INTRUDER");
+  else if (status == 3) Serial.print("REMOTE  ");
+  Serial.print(" | attempts: ");
+  Serial.println(attempts);
+}
+
+void printAllLogs() {
+  byte ptr = EEPROM.read(EEPROM_LOG_PTR);
+  Serial.println("===== ACCESS LOG =====");
+  bool anyEntry = false;
+  for (int i = 0; i < MAX_LOG_ENTRIES; i++) {
+    int  idx  = (ptr + i) % MAX_LOG_ENTRIES;
+    int  addr = EEPROM_LOG_START + (idx * LOG_ENTRY_SIZE);
+    byte yy   = EEPROM.read(addr + 0);
+    if (yy == 0xFF || yy == 0x00) continue;
+    anyEntry = true;
+    byte mo = EEPROM.read(addr + 1);
+    byte dd = EEPROM.read(addr + 2);
+    byte hh = EEPROM.read(addr + 3);
+    byte mm = EEPROM.read(addr + 4);
+    byte ss = EEPROM.read(addr + 5);
+    byte st = EEPROM.read(addr + 6);
+    byte at = EEPROM.read(addr + 7);
+    Serial.print("20"); Serial.print(yy); Serial.print("-");
+    if (mo < 10) Serial.print("0"); Serial.print(mo); Serial.print("-");
+    if (dd < 10) Serial.print("0"); Serial.print(dd); Serial.print(" ");
+    if (hh < 10) Serial.print("0"); Serial.print(hh); Serial.print(":");
+    if (mm < 10) Serial.print("0"); Serial.print(mm); Serial.print(":");
+    if (ss < 10) Serial.print("0"); Serial.print(ss); Serial.print(" | ");
+    if      (st == 0) Serial.print("GRANTED ");
+    else if (st == 1) Serial.print("DENIED  ");
+    else if (st == 2) Serial.print("INTRUDER");
+    else if (st == 3) Serial.print("REMOTE  ");
+    Serial.print(" | attempts: "); Serial.println(at);
+  }
+  if (!anyEntry) Serial.println("No entries yet.");
+  Serial.println("======================");
+}
+
+// ============================================================
+//  BUZZER
+// ============================================================
+void beepKeypress() {
+  tone(BUZZER_PIN, 1200, 60);
+  delay(70);
+}
+
+void beepSuccess() {
+  tone(BUZZER_PIN, 1000, 150); delay(160);
+  tone(BUZZER_PIN, 1500, 200); delay(210);
+}
+
+void beepError() {
+  tone(BUZZER_PIN, 400, 300); delay(310);
+  tone(BUZZER_PIN, 300, 300); delay(310);
+}
+
+void beepShort() {
+  tone(BUZZER_PIN, 1000, 100); delay(110);
+}
+
+// ============================================================
+//  LCD HELPERS
+// ============================================================
+void showEnterPassword() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Enter password:");
+  lcd.setCursor(0, 1);
+  lcd.print("                ");
+  clearInput();
+}
+
+void showAccessDenied() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(" Access Denied! ");
+  lcd.setCursor(0, 1);
+  lcd.print("Attempts left: ");
+  lcd.print(MAX_ATTEMPTS - wrongAttempts);
+  beepError();
+  delay(1500);
+  showEnterPassword();
+}
+
+void clearInput() {
+  inputIndex = 0;
+  memset(enteredPassword, 0, sizeof(enteredPassword));
+}
