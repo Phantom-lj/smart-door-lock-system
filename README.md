@@ -13,9 +13,7 @@ An advanced IoT-enabled door lock system built on **Arduino Uno + ESP8266**, fea
 
 ## 📽️ Demo
 
-> *(Insert your Wokwi screen recording GIF or video here)*
-> 
-> You can convert your screen recording to GIF using [ezgif.com](https://ezgif.com/video-to-gif) and drag-drop it into this README on GitHub.
+>![alt text](Untitleddesign-ezgif.com-video-to-gif-converter-1.gif)
 
 ---
 
@@ -307,8 +305,8 @@ All 14 test cases passed on Wokwi simulation:
 B.Tech Electronics & Communication Engineering  
 Manipal University Jaipur  
 
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat&logo=linkedin)](https://linkedin.com/in/YOUR_PROFILE)
-[![GitHub](https://img.shields.io/badge/GitHub-Follow-181717?style=flat&logo=github)](https://github.com/YOUR_USERNAME)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0A66C2?style=flat&logo=linkedin)](https://www.linkedin.com/in/lakshya-jain-46a1141a0/)
+[![GitHub](https://img.shields.io/badge/GitHub-Follow-181717?style=flat&logo=github)](https://github.com/Phantom-lj)
 
 ---
 
